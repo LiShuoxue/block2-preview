@@ -2308,6 +2308,178 @@ class DMRGDriver:
             ancilla=ancilla,
         )
 
+    def get_qc_eph_mpo(
+        self,
+        h1e,
+        g2e,
+        geph,           # 
+        omega,          #
+        ecore=0,
+        para_type=None,
+        reorder=None,
+        cutoff=1e-20,
+        integral_cutoff=1e-20,
+        post_integral_cutoff=1e-20,
+        algo_type=None,
+        normal_order_ref=None,
+        normal_order_wick=True,
+        symmetrize=True,
+        sum_mpo_mod=-1,
+        compute_accurate_svd_error=True,
+        csvd_sparsity=0.0,
+        csvd_eps=1e-10,
+        csvd_max_iter=1000,
+        disjoint_levels=None,
+        disjoint_all_blocks=False,
+        disjoint_multiplier=1.0,
+        block_max_length=False,
+        add_ident=True,
+        iprint=1,
+    ):
+        import numpy as np
+
+        bw = self.bw
+
+        if isinstance(g2e, np.ndarray):
+            g2e = self.unpack_g2e(g2e)
+        elif isinstance(g2e, tuple):
+            g2e = tuple(self.unpack_g2e(x) for x in g2e)
+
+        if SymmetryTypes.SZ in bw.symm_type:
+            if h1e is not None and isinstance(h1e, np.ndarray) and h1e.ndim == 2:
+                h1e = (h1e, h1e)
+            if g2e is not None and isinstance(g2e, np.ndarray) and g2e.ndim == 4:
+                g2e = (g2e, g2e, g2e)
+            
+            # TODO: electron-phonon part
+            if geph is not None and isinstance(geph, np.ndarray) and geph.ndim == 3:
+                geph = (geph, geph)
+        
+        # build Hamiltonian expression
+        b = self.expr_builder()
+
+        if normal_order_ref is None:
+            if SymmetryTypes.SU2 in bw.symm_type:
+                if h1e is not None:
+                    b.add_sum_term("(C+D)0", np.sqrt(2) * h1e)
+                if g2e is not None:
+                    b.add_sum_term("((C+(C+D)0)1+D)0", g2e.transpose(0, 2, 3, 1))
+            elif SymmetryTypes.SZ in bw.symm_type:
+                if h1e is not None:
+                    b.add_sum_term("cd", h1e[0])
+                    b.add_sum_term("CD", h1e[1])
+                if g2e is not None:
+                    b.add_sum_term("ccdd", 0.5 * g2e[0].transpose(0, 2, 3, 1))
+                    b.add_sum_term("cCDd", 0.5 * g2e[1].transpose(0, 2, 3, 1))
+                    b.add_sum_term("CcdD", 0.5 * g2e[1].transpose(2, 0, 1, 3))
+                    b.add_sum_term("CCDD", 0.5 * g2e[2].transpose(0, 2, 3, 1))
+
+                # TODO: electron-phonon part
+                if geph is not None:
+                    b.add_eph_terms("cdE", geph[0])
+                    b.add_eph_terms("cdF", geph[0])
+                    b.add_eph_terms("CDE", geph[1])
+                    b.add_eph_terms("CDF", geph[1])
+
+                    dim_e = geph[0].shape[0]
+
+                # TODO: Pure Phonon part
+
+                    if omega is not None:
+                        dim_p = omega.shape[0]
+                        b.add_term("EF", 
+                        np.array([[i, i] for i in range(dim_e, dim_e+dim_p)]).flatten(),
+                        list(omega)
+                        )
+
+            elif SymmetryTypes.SGF in bw.symm_type:
+                if h1e is not None:
+                    b.add_sum_term("CD", h1e)
+                if g2e is not None:
+                    b.add_sum_term("CCDD", 0.5 * g2e.transpose(0, 2, 3, 1))
+            elif SymmetryTypes.SGB in bw.symm_type:
+                h_terms = FermionTransform.jordan_wigner(h1e, g2e)
+                for k, (x, v) in h_terms.items():
+                    b.add_term(k, x, v)
+        else:
+            if SymmetryTypes.SU2 in bw.symm_type:
+                h1es, g2es, ecore = NormalOrder.make_su2(
+                    h1e, g2e, ecore, normal_order_ref, normal_order_wick
+                )
+            elif SymmetryTypes.SZ in bw.symm_type:
+                h1es, g2es, ecore = NormalOrder.make_sz(
+                    h1e, g2e, ecore, normal_order_ref, normal_order_wick
+                )
+            elif SymmetryTypes.SGF in bw.symm_type:
+                h1es, g2es, ecore = NormalOrder.make_sgf(
+                    h1e, g2e, ecore, normal_order_ref, normal_order_wick
+                )
+
+            if self.mpi is not None:
+                ec_arr = np.array([ecore], dtype=float)
+                self.mpi.reduce_sum(ec_arr, self.mpi.root)
+                if self.mpi.rank == self.mpi.root:
+                    ecore = ec_arr[0]
+                else:
+                    ecore = 0.0
+
+            if post_integral_cutoff != 0:
+                error = 0
+                for k, v in h1es.items():
+                    mask = np.abs(v) < post_integral_cutoff
+                    error += np.sum(np.abs(v[mask]))
+                    h1es[k][mask] = 0
+                for k, v in g2es.items():
+                    mask = np.abs(v) < post_integral_cutoff
+                    error += np.sum(np.abs(v[mask]))
+                    g2es[k][mask] = 0
+                if iprint:
+                    print("post integral cutoff error = ", error)
+
+            for k, v in h1es.items():
+                b.add_sum_term(k, v)
+            for k, v in g2es.items():
+                b.add_sum_term(k, v)
+
+            if iprint:
+                print("normal ordered ecore = ", ecore)
+
+        b.add_const(ecore)
+
+
+
+        bx = b.finalize(adjust_order=SymmetryTypes.SGB not in bw.symm_type)
+
+        if iprint:
+            if self.mpi is not None:
+                for i in range(self.mpi.size):
+                    self.mpi.barrier()
+                    if i == self.mpi.rank:
+                        print(
+                            "rank = %5d mpo terms = %10d"
+                            % (i, sum([len(x) for x in bx.data]))
+                        )
+                    self.mpi.barrier()
+            else:
+                print("mpo terms = %10d" % sum([len(x) for x in bx.data]))
+
+        return self.get_mpo(
+            bx,
+            iprint=iprint,
+            cutoff=cutoff,
+            algo_type=algo_type,
+            sum_mpo_mod=sum_mpo_mod,
+            compute_accurate_svd_error=compute_accurate_svd_error,
+            csvd_sparsity=csvd_sparsity,
+            csvd_eps=csvd_eps,
+            csvd_max_iter=csvd_max_iter,
+            disjoint_levels=disjoint_levels,
+            disjoint_all_blocks=disjoint_all_blocks,
+            disjoint_multiplier=disjoint_multiplier,
+            block_max_length=block_max_length,
+            add_ident=add_ident,
+        )
+
     def get_mpo(
         self,
         expr,
@@ -4891,6 +5063,22 @@ class ExprBuilder:
                 didx.extend(ix)
                 dt.append(v)
         self.data.indices.append(self.bw.b.VectorUInt16(didx))
+        self.data.data.append(self.bw.VectorFL(dt))
+        return self
+    
+    def add_eph_terms(self, expr, arr, cutoff=1E-12):
+
+        import numpy as np
+
+        dim_e, _, dim_p = arr.shape
+
+        self.data.exprs.append(expr)
+        idx, dt = [], []
+        for ix in np.ndindex(*arr.shape):
+            if abs(arr[ix]) > cutoff:
+                idx.extend(np.array([ix[0], ix[1], ix[2]+dim_e]))
+                dt.append(arr[ix])
+        self.data.indices.append(self.bw.b.VectorUInt16(idx))
         self.data.data.append(self.bw.VectorFL(dt))
         return self
 
